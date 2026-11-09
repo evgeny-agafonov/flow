@@ -23,7 +23,8 @@ const matcher = (route: string) => {
 /**
  * Answers the listed requests — keyed "METHOD /path" (or "/path" for any method; `:id`
  * matches one segment; the query string is ignored) — with their JSON body, a Response, or a
- * function of the request init returning either. Every other request stays unanswered and
+ * function of the request init returning either (or a promise of either, to hold the answer
+ * back until the test resolves it). Every other request stays unanswered and
  * still fails the test.
  */
 export function answerFetch(routes: Record<string, Answer>) {
@@ -35,7 +36,7 @@ export function answerFetch(routes: Record<string, Answer>) {
     if (!route) return unansweredFetch(input, init);
 
     const { answer } = route;
-    const body = typeof answer === 'function' ? (answer as (i?: RequestInit) => unknown)(init) : answer;
+    const body = typeof answer === 'function' ? await (answer as (i?: RequestInit) => unknown)(init) : answer;
     return body instanceof Response ? body : jsonResponse(body);
   });
 }

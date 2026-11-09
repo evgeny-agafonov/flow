@@ -54,6 +54,10 @@ governance, community health — carry none.
   edits a build file or runs a command on a path an earlier command printed.
 
 ### Fixed
+- **Sign-in & onboarding**: opening one agent after another on the "Connect your
+  agents" step no longer leaves every agent stuck on "Connecting" with "Get
+  started" disabled. Collapsing an agent or opening another one now ends the
+  login still in progress for it, so only the open agent holds a login.
 - **Sessions & Runs**: an automatic Kiro step whose agent ends its turn without
   `finish_session` no longer waits for a person. A minute or two later the agent
   is reminded in its terminal to finish or continue, up to 3 times, and the step

@@ -550,6 +550,79 @@ describe('Onboarding/OnboardingPage', () => {
     );
   });
 
+  it("finishes an agent's login as soon as the user opens another agent", async () => {
+    const fetchSpy = answerFetch({
+      'POST /api/v1/terminal_sessions/:id/finish': { data: buildTerminalSession({ state: 'finishing' }) },
+    });
+    renderAuthedPage(<OnboardingPage />, {
+      props: {
+        currentUser: userAt({ onboardingState: 'step2' }),
+        authSessions: [
+          buildTerminalSession({ id: 7, agentType: 'claude_code', state: 'ready' }),
+          buildTerminalSession({ id: 8, agentType: 'cursor_cli', state: 'ready' }),
+        ],
+      },
+    });
+
+    await userEvent.click(screen.getAllByRole('button', { name: 'Connect' })[0]);
+    // Claude's own button now reads Collapse, so Cursor is the first Connect.
+    await userEvent.click(screen.getAllByRole('button', { name: 'Connect' })[0]);
+
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    expect(fetchSpy).toHaveBeenCalledWith(
+      '/api/v1/terminal_sessions/7/finish',
+      expect.objectContaining({ method: 'POST' }),
+    );
+  });
+
+  it("finishes an agent's login when the user collapses its row", async () => {
+    const fetchSpy = answerFetch({
+      'POST /api/v1/terminal_sessions/:id/finish': { data: buildTerminalSession({ state: 'finishing' }) },
+    });
+    renderAuthedPage(<OnboardingPage />, {
+      props: {
+        currentUser: userAt({ onboardingState: 'step2' }),
+        authSessions: [buildTerminalSession({ id: 7, agentType: 'claude_code', state: 'queued' })],
+      },
+    });
+
+    await userEvent.click(screen.getAllByRole('button', { name: 'Connect' })[0]);
+    await userEvent.click(screen.getByRole('button', { name: 'Collapse' }));
+
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    expect(fetchSpy).toHaveBeenCalledWith(
+      '/api/v1/terminal_sessions/7/finish',
+      expect.objectContaining({ method: 'POST' }),
+    );
+    // The row's terminal is gone, so the page itself refreshes the badge.
+    await waitFor(() => expect(router.reload).toHaveBeenCalledWith({ only: ['auth_sessions'] }));
+  });
+
+  it('finishes a login whose row was collapsed before its create request answered', async () => {
+    const answerCreate = new Map<string, (body: unknown) => void>();
+    const fetchSpy = answerFetch({
+      'POST /api/v1/terminal_sessions': (init?: RequestInit) =>
+        new Promise((resolve) => answerCreate.set(JSON.parse(String(init?.body)).terminalSession.agentType, resolve)),
+      'POST /api/v1/terminal_sessions/:id/finish': { data: buildTerminalSession({ state: 'finishing' }) },
+    });
+    renderAuthedPage(<OnboardingPage />, {
+      props: { currentUser: userAt({ onboardingState: 'step2' }), authSessions: [] },
+    });
+
+    await userEvent.click(screen.getAllByRole('button', { name: 'Connect' })[0]);
+    await waitFor(() => expect(answerCreate.has('claude_code')).toBe(true));
+    // Opening Cursor collapses Claude while Claude's login is still being created.
+    await userEvent.click(screen.getAllByRole('button', { name: 'Connect' })[0]);
+    answerCreate.get('claude_code')?.({ data: buildTerminalSession({ id: 21, agentType: 'claude_code' }) });
+
+    await waitFor(() =>
+      expect(fetchSpy).toHaveBeenCalledWith(
+        '/api/v1/terminal_sessions/21/finish',
+        expect.objectContaining({ method: 'POST' }),
+      ),
+    );
+  });
+
   it('starts a stuck login over: the session is reset and the agent sessions reloaded', async () => {
     installFakeWebSocket();
     const fetchSpy = answerFetch({

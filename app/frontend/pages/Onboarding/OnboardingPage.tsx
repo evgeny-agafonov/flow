@@ -126,11 +126,15 @@ function AgentAuthTerminal({
   session,
   isConfigured,
   onAuthenticated,
+  onLoginCreated,
+  onLoginEnded,
 }: {
   agentType: string;
   session?: TerminalSession;
   isConfigured: boolean;
   onAuthenticated: () => void;
+  onLoginCreated: (agentType: string, id: number) => void;
+  onLoginEnded: (id: number) => void;
 }) {
   const [authDetected, setAuthDetected] = useState(false);
   const [finishError, setFinishError] = useState(false);
@@ -161,6 +165,9 @@ function AgentAuthTerminal({
         body: JSON.stringify({ terminalSession: { agentType, sessionType: 'auth_setup', mode: 'interactive' } }),
       });
       if (res.ok) {
+        const body = await res.json().catch(() => null);
+        const id = (body?.data ?? body)?.id;
+        if (typeof id === 'number') onLoginCreated(agentType, id);
         router.reload({ only: ['auth_sessions'] });
       } else {
         creatingRef.current = false;
@@ -168,7 +175,7 @@ function AgentAuthTerminal({
     } catch {
       creatingRef.current = false;
     }
-  }, [agentType]);
+  }, [agentType, onLoginCreated]);
 
   useEffect(() => {
     if (isConfigured || session || creatingRef.current) return;
@@ -206,14 +213,14 @@ function AgentAuthTerminal({
     setFinishError(false);
     try {
       await apiRequest(finishApiV1TerminalSessionPath(session.id), { method: 'POST' });
-
+      onLoginEnded(session.id);
       onAuthenticated();
     } catch {
       finishedRef.current = false;
       setFinishError(true);
       notifications.show({ message: 'Failed to save authentication', color: 'red' });
     }
-  }, [session, onAuthenticated]);
+  }, [session, onAuthenticated, onLoginEnded]);
 
   // Auto-finish as soon as the watcher confirms credentials exist — no manual
   // "save" step. Credentials are persisted server-side during session cleanup.
@@ -228,6 +235,7 @@ function AgentAuthTerminal({
     setResettingId(session.id);
     try {
       await apiRequest(resetApiV1TerminalSessionPath(session.id), { method: 'POST' });
+      onLoginEnded(session.id);
       setAuthDetected(false);
       setFinishError(false);
       finishedRef.current = false;
@@ -236,7 +244,7 @@ function AgentAuthTerminal({
       setResettingId(null);
       notifications.show({ message: 'Failed to start over', color: 'red' });
     }
-  }, [session]);
+  }, [session, onLoginEnded]);
 
   if (isConfigured) {
     return (
@@ -344,35 +352,75 @@ function AgentAuthTerminal({
 
 const UNFINISHED_LOGIN_STATES: ReadonlyArray<TerminalSession['state']> = ['not_started', 'queued', 'running', 'ready'];
 
-// Leaving the step — Back, Skip, Get started, another page, closing or reloading the tab —
-// finishes the unfinished logins this tab opened, so their containers go now instead of at
-// the login TTL. Only the ones it opened: `sessions` lists every active login the user has
-// in the company, including another tab's and the profile page's.
+// A login lives only while its agent's row is open. Collapsing the row, opening another agent,
+// or leaving the step — Back, Skip, Get started, another page, closing or reloading the tab —
+// finishes the unfinished logins this tab opened. A user runs two logins at a time
+// (SessionAdmissionService::AUTH_POOL_LIMIT), so a login left behind in a collapsed row held a
+// slot until the login TTL and queued every agent opened after it.
+// Only the ones this tab opened: `sessions` lists every active login the user has in the
+// company, including another tab's and the profile page's. A login is this tab's once its
+// create request answers, not only once the reload lists it — a row collapsed in between
+// would otherwise leave its login running.
 // Finish, not reset: a reset cancels the session and its cleanup then saves nothing, which
 // would throw away a login the user completed in the CLI before the watcher noticed or
 // before a failed auto-finish was retried. StrictMode unmounts and remounts on mount,
-// synchronously, so the finish waits a microtask and skips if the step is mounted again
+// synchronously, so the leave waits a microtask and skips if the step is mounted again
 // by then. `keepalive` lets the request outlive a closing tab.
-function useFinishOpenedLoginsOnLeave(sessions: TerminalSession[], expandedAgent: string | null) {
-  const openedIdsRef = useRef(new Set<number>());
-  const unfinishedIdsRef = useRef<number[]>([]);
+function useLoginsOfOpenRowOnly(sessions: TerminalSession[], expandedAgent: string | null) {
+  const ownedRef = useRef(new Map<number, string>());
+  const endedIdsRef = useRef(new Set<number>());
+  const listedIdsRef = useRef(new Set<number>());
+  const sessionsRef = useRef(sessions);
+  const expandedAgentRef = useRef(expandedAgent);
   const mountedRef = useRef(false);
 
+  const finishLogins = useCallback((keptAgent: string | null) => {
+    // A login the reload has not listed yet is still starting. One listed before and gone now
+    // has ended on its own, and finishing it again would only be refused.
+    const isUnfinished = (id: number) => {
+      const listed = sessionsRef.current.find((s) => s.id === id);
+      if (listed) return UNFINISHED_LOGIN_STATES.includes(listed.state);
+      return !listedIdsRef.current.has(id);
+    };
+    const finishing: Promise<void>[] = [];
+    for (const [id, agentType] of ownedRef.current) {
+      if (agentType === keptAgent || endedIdsRef.current.has(id) || !isUnfinished(id)) continue;
+      endedIdsRef.current.add(id);
+      finishing.push(
+        apiFetch(finishApiV1TerminalSessionPath(id), { method: 'POST', keepalive: true }).then(
+          (res) => {
+            if (!res.ok) endedIdsRef.current.delete(id);
+          },
+          () => {
+            endedIdsRef.current.delete(id);
+          },
+        ),
+      );
+    }
+    // The collapsed row's terminal was the only subscriber to its session's updates.
+    if (finishing.length > 0) {
+      Promise.all(finishing).then(() => {
+        if (mountedRef.current) router.reload({ only: ['auth_sessions'] });
+      });
+    }
+  }, []);
+
   useEffect(() => {
+    sessionsRef.current = sessions;
+    for (const s of sessions) listedIdsRef.current.add(s.id);
+    if (expandedAgent === null) return;
     const shown = sessions.find((s) => s.agentType === expandedAgent);
-    if (shown) openedIdsRef.current.add(shown.id);
-    unfinishedIdsRef.current = sessions
-      .filter((s) => openedIdsRef.current.has(s.id) && UNFINISHED_LOGIN_STATES.includes(s.state))
-      .map((s) => s.id);
+    if (shown) ownedRef.current.set(shown.id, expandedAgent);
   }, [sessions, expandedAgent]);
 
   useEffect(() => {
+    expandedAgentRef.current = expandedAgent;
+    finishLogins(expandedAgent);
+  }, [expandedAgent, finishLogins]);
+
+  useEffect(() => {
     mountedRef.current = true;
-    const finishAll = () => {
-      for (const id of unfinishedIdsRef.current) {
-        apiFetch(finishApiV1TerminalSessionPath(id), { method: 'POST', keepalive: true }).catch(() => {});
-      }
-    };
+    const finishAll = () => finishLogins(null);
     window.addEventListener('pagehide', finishAll);
     return () => {
       mountedRef.current = false;
@@ -381,7 +429,22 @@ function useFinishOpenedLoginsOnLeave(sessions: TerminalSession[], expandedAgent
         if (!mountedRef.current) finishAll();
       });
     };
+  }, [finishLogins]);
+
+  // The create request can answer after its row was collapsed: that login is finished at once.
+  const loginCreated = useCallback(
+    (agentType: string, id: number) => {
+      ownedRef.current.set(id, agentType);
+      if (expandedAgentRef.current !== agentType) finishLogins(expandedAgentRef.current);
+    },
+    [finishLogins],
+  );
+
+  const loginEnded = useCallback((id: number) => {
+    endedIdsRef.current.add(id);
   }, []);
+
+  return { loginCreated, loginEnded };
 }
 
 // ── Step 2+3: Connect Agents (unified) ────────────
@@ -404,7 +467,7 @@ function ConnectAgentsStep({
   onSkip: () => void;
 }) {
   const [expandedAgent, setExpandedAgent] = useState<string | null>(null);
-  useFinishOpenedLoginsOnLeave(authSessions, expandedAgent);
+  const { loginCreated, loginEnded } = useLoginsOfOpenRowOnly(authSessions, expandedAgent);
   const configuredCount = AVAILABLE_AGENTS.filter((a) => configuredAgents.includes(a.type)).length;
   const canSkip = isAdmin && configuredCount === 0;
 
@@ -516,6 +579,8 @@ function ConnectAgentsStep({
                       agentType={agent.type}
                       session={session}
                       isConfigured={false}
+                      onLoginCreated={loginCreated}
+                      onLoginEnded={loginEnded}
                       onAuthenticated={() => {
                         setExpandedAgent(null);
                         router.reload();
